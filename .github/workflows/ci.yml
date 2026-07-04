@@ -1,0 +1,110 @@
+# =============================================================================
+# Continuous Integration
+#
+# Runs on every push to main, develop, or feature/* branches, and on every
+# pull request targeting main.
+#
+# Jobs:
+#   1. test   — Unit & integration tests (model + API).
+#   2. build  — Build the Docker image and tag it with the git SHA.
+#
+# IMPORTANT: Tests MUST be run from the `tests/` directory because they use
+# relative paths (e.g. `../data/data.csv`) to locate the training dataset.
+# =============================================================================
+
+name: "Continuous Integration"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - feature/*
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-flight runs for the same branch — saves CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.9"
+  IMAGE_NAME: flight-delay-api
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job: test — Run model and API tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements-test.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+
+      - name: Run model tests
+        run: |
+          cd tests && pytest model/test_model.py -v --junitxml=../reports/model-test-results.xml
+
+      - name: Run API tests
+        run: |
+          cd tests && pytest api/test_api.py -v --junitxml=../reports/api-test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: reports/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job: build — Build Docker image and tag with git SHA
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          # Do NOT push — CI only validates that the image builds.
+          # The CD pipeline handles pushing to the registry.
+          push: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
