@@ -1,0 +1,9 @@
+[run]
+source = challenge
+omit =
+    */tests/*
+    */__init__.py
+
+[report]
+show_missing = True
+fail_under = 80
