@@ -2,7 +2,7 @@
 # Deploy: fly deploy
 # Docs: https://fly.io/docs/reference/configuration/
 
-app = "flight-delay-api"
+app = "challenge-mle-api"
 
 [build]
   dockerfile = "Dockerfile"
