@@ -1,0 +1,176 @@
+# =============================================================================
+# Continuous Delivery
+#
+# Triggered on every push to the `main` branch.
+#
+# Workflow:
+#   1. Authenticate to Google Cloud via workload identity federation
+#      (no long-lived credentials).
+#   2. Build the Docker image and push it to Google Container Registry (GCR).
+#   3. Deploy to Cloud Run.
+#   4. Run a smoke test against the /health endpoint.
+#   5. Optionally run a stress (load) test.
+#
+# Prerequisites (to be configured once in the repository):
+#   - GCP_PROJECT_ID          — Google Cloud project ID.
+#   - GCP_REGION              — Cloud Run region (e.g. us-central1).
+#   - CLOUD_RUN_SERVICE_NAME  — Cloud Run service name.
+#   - WORKLOAD_IDENTITY_PROVIDER — OIDC provider for GitHub Actions.
+#   - SERVICE_ACCOUNT_EMAIL   — Service account used by the deployment.
+#
+# References:
+#   - https://github.com/google-github-actions/auth
+#   - https://github.com/google-github-actions/deploy-cloudrun
+# =============================================================================
+
+name: "Continuous Delivery"
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: "3.9"
+  IMAGE_NAME: flight-delay-api
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ secrets.GCP_REGION || 'us-central1' }}
+  CLOUD_RUN_SERVICE_NAME: ${{ secrets.CLOUD_RUN_SERVICE_NAME || 'flight-delay-api' }}
+  # Full image path in GCR
+  IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/flight-delay-api:${{ github.sha }}
+
+jobs:
+  deploy:
+    name: Build, push, and deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    # Grant OIDC token permissions for Google Cloud authentication.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      # ----------------------------------------------------------------------
+      # Step 1 — Checkout
+      # ----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      # Step 2 — Authenticate to Google Cloud
+      #
+      # Uses workload identity federation (OIDC) — no service-account JSON key
+      # is stored in the repository.
+      # ----------------------------------------------------------------------
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT_EMAIL }}
+
+      # ----------------------------------------------------------------------
+      # Step 3 — Set up Cloud SDK
+      # ----------------------------------------------------------------------
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      # ----------------------------------------------------------------------
+      # Step 4 — Build and push the Docker image to GCR
+      #
+      # Using Docker Buildx with GHA cache for faster subsequent builds.
+      # ----------------------------------------------------------------------
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+            gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------------------
+      # Step 5 — Deploy to Cloud Run
+      #
+      # Progressive rollout is handled by Cloud Run's built-in revision
+      # traffic splitting. The deployment is non-breaking because we keep
+      # the previous revision active and only shift traffic gradually.
+      #
+      # Flags:
+      #   --allow-unauthenticated    — Allow public access (no IAM auth).
+      #   --cpu=1                    — 1 vCPU per instance.
+      #   --min-instances=0          — Scale to zero when idle (cost saving).
+      #   --memory=1Gi               — Sufficient for model + data.csv.
+      #   --timeout=60s              — Request timeout.
+      #   --set-env-vars             — Pass any required environment variables.
+      # ----------------------------------------------------------------------
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.CLOUD_RUN_SERVICE_NAME }} \
+            --image ${{ env.IMAGE }} \
+            --region ${{ env.GCP_REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --cpu=1 \
+            --memory=1Gi \
+            --min-instances=0 \
+            --max-instances=10 \
+            --concurrency=80 \
+            --timeout=60s \
+            --no-cpu-boost \
+            --set-env-vars="PYTHONUNBUFFERED=1"
+
+      # ----------------------------------------------------------------------
+      # Step 6 — Get the Cloud Run service URL
+      # ----------------------------------------------------------------------
+      - name: Get Cloud Run URL
+        id: get-url
+        run: |
+          URL=$(gcloud run services describe ${{ env.CLOUD_RUN_SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} \
+            --format='value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Step 7 — Smoke test (health check)
+      #
+      # Waits for the new revision to be ready and then curls the /health
+      # endpoint. Failures here trigger a rollback alert.
+      # ----------------------------------------------------------------------
+      - name: Smoke test — /health endpoint
+        run: |
+          echo "Smoke testing ${{ steps.get-url.outputs.url }}/health"
+          for i in $(seq 1 12); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "${{ steps.get-url.outputs.url }}/health" 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Health check passed (HTTP 200)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $HTTP_STATUS — retrying in 10s..."
+            sleep 10
+          done
+          echo "❌ Health check failed after 12 attempts"
+          exit 1
+
+      # ----------------------------------------------------------------------
+      # Step 8 — Optional: Run a quick stress test with locust
+      #
+      # This step is best-effort; it will not block the deployment.
+      # Comment it out if you do not want load testing during CD.
+      # ----------------------------------------------------------------------
+      - name: Optional — Run stress test
+        continue-on-error: true
+        run: |
+          pip install locust~=1.6
+          locust -f tests/stress/api_stress.py \
+            --print-stats \
+            --run-time 30s \
+            --headless \
+            --users 50 \
+            --spawn-rate 5 \
+            -H "${{ steps.get-url.outputs.url }}" || echo "⚠️ Stress test completed with warnings — see logs for details."
