@@ -25,11 +25,11 @@ install:		## Install dependencies
 	pip install -r requirements-test.txt
 	pip install -r requirements.txt
 
-STRESS_URL = http://127.0.0.1:8000
+STRESS_URL = https://challenge-mle-api.fly.dev
 .PHONY: stress-test
 stress-test:
 	# Override STRESS_URL with your deployed app URL, e.g.:
-	#   make stress-test STRESS_URL=https://flight-delay-api.fly.dev
+	#   make stress-test STRESS_URL=https://challenge-mle-api.fly.dev
 	mkdir -p reports
 	locust -f tests/stress/api_stress.py --print-stats --html reports/stress-test.html --run-time 60s --headless --users 100 --spawn-rate 1 -H $(STRESS_URL)
 
